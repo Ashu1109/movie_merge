@@ -1,4 +1,5 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import os
@@ -28,6 +29,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Video Merger API", lifespan=lifespan)
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+)
+
 # Create a temporary directory for storing downloaded files
 TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -47,6 +57,7 @@ class MergeResponse(BaseModel):
     message: str
 
 @app.get("/")
+@app.head("/")
 async def root():
     return {"message": "Video Merger API is running"}
 
