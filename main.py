@@ -1,386 +1,307 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
-from fastapi.responses import StreamingResponse
-import io
 import os
-import tempfile
 import uuid
-import requests
-from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip
-import logging
 import shutil
-from contextlib import asynccontextmanager
+import requests
+import logging
+from typing import List, Optional
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+import json
+from pydantic import BaseModel
+from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips, CompositeAudioClip
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Create a lifespan context manager
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup logic
-    logger.info("Starting up Video Merger API")
-    yield
-    # Shutdown logic
-    logger.info("Shutting down Video Merger API")
-    # Clean up temp directory
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
+# Create necessary directories
+TEMP_DIR = "temp"
+OUTPUT_DIR = "output"
 
-app = FastAPI(title="Video Merger API", lifespan=lifespan)
+# Get absolute paths
+TEMP_DIR = os.path.abspath(TEMP_DIR)
+OUTPUT_DIR = os.path.abspath(OUTPUT_DIR)
+
+# Create directories
+logger.info(f"Creating directories: TEMP_DIR={TEMP_DIR}, OUTPUT_DIR={OUTPUT_DIR}")
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+logger.info(f"Directories created successfully")
+
+app = FastAPI()
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Create a temporary directory for storing downloaded files
-TEMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
-os.makedirs(TEMP_DIR, exist_ok=True)
-
-# Create output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 class MergeRequest(BaseModel):
-    videos: List[str]
-    background_audio: str
-    narration: str
-    max_duration: int = 600  # Default max duration in seconds
+    video_urls: List[str]
+    background_audio_url: Optional[str] = None
+    background_volume: Optional[float] = 0.5
 
-class MergeResponse(BaseModel):
-    output_file: str
-    message: str
-
-@app.get("/")
-@app.head("/")
-async def root():
-    return {"message": "Video Merger API is running"}
-
-def download_file(url, save_path):
-    """Download a file from a URL and save it to the specified path."""
-    try:
-        logger.info(f"Downloading file from {url}")
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-        
-        with open(save_path, 'wb') as f:
+def download_file(url, output_path):
+    """Download a file from URL to the specified path"""
+    response = requests.get(url, stream=True)
+    if response.status_code == 200:
+        with open(output_path, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-        
-        logger.info(f"File downloaded successfully to {save_path}")
-        return save_path
-    except Exception as e:
-        logger.error(f"Error downloading file from {url}: {str(e)}")
-        raise
+        return True
+    return False
 
-def process_videos(request: MergeRequest):
-    """Process the videos and audio files according to the request."""
-    try:
-        # Create a unique job ID
-        job_id = str(uuid.uuid4())
-        job_dir = os.path.join(TEMP_DIR, job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        
-        # Download all videos
-        video_paths = []
-        for i, video_url in enumerate(request.videos):
-            video_path = os.path.join(job_dir, f"video_{i}.mp4")
-            download_file(video_url, video_path)
-            video_paths.append(video_path)
-        
-        # Download audio files
-        bg_audio_path = os.path.join(job_dir, "background.mp3")
-        download_file(request.background_audio, bg_audio_path)
-        
-        narration_path = os.path.join(job_dir, "narration.mp3")
-        download_file(request.narration, narration_path)
-        
-        # Load video clips
-        video_clips = []
-        for path in video_paths:
+def cleanup_files(file_paths):
+    """Clean up temporary files"""
+    logger.info(f"Cleaning up files: {file_paths}")
+    for file_path in file_paths:
+        if os.path.exists(file_path):
             try:
-                clip = VideoFileClip(path)
-                video_clips.append(clip)
-                logger.info(f"Loaded video clip: {path}, duration: {clip.duration}")
+                if os.path.isdir(file_path):
+                    logger.info(f"Removing directory: {file_path}")
+                    shutil.rmtree(file_path)
+                else:
+                    logger.info(f"Removing file: {file_path}")
+                    os.remove(file_path)
+                logger.info(f"Successfully removed: {file_path}")
             except Exception as e:
-                logger.error(f"Error loading video clip {path}: {str(e)}")
-                # Continue with other clips if one fails
-        
-        if not video_clips:
-            raise Exception("No valid video clips could be loaded")
-        
-        # Concatenate video clips
-        final_video = concatenate_videoclips(video_clips, method="compose")
-        
-        # Limit video duration if needed
-        if final_video.duration > request.max_duration:
-            logger.info(f"Trimming video to max duration: {request.max_duration}s")
-            final_video = final_video.subclip(0, request.max_duration)
-        
-        # Load audio clips
-        try:
-            background_audio = AudioFileClip(bg_audio_path)
-            # Loop background audio if it's shorter than the video
-            if background_audio.duration < final_video.duration:
-                background_audio = background_audio.fx(
-                    lambda clip: clip.loop(duration=final_video.duration)
-                )
-            else:
-                # Trim background audio if it's longer than the video
-                background_audio = background_audio.subclip(0, final_video.duration)
-            
-            narration_audio = AudioFileClip(narration_path)
-            # Trim narration if it's longer than the video
-            if narration_audio.duration > final_video.duration:
-                narration_audio = narration_audio.subclip(0, final_video.duration)
-            
-            # Adjust volumes
-            background_audio = background_audio.volumex(0.3)  # Lower background volume
-            
-            # Combine audio tracks
-            final_audio = CompositeAudioClip([background_audio, narration_audio])
-            
-            # Set the audio of the final video
-            final_video = final_video.set_audio(final_audio)
-            
-        except Exception as e:
-            logger.error(f"Error processing audio: {str(e)}")
-            # Continue with just the video if audio processing fails
-        
-        # Save the final video
-        output_filename = f"merged_video_{job_id}.mp4"
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-        
-        logger.info(f"Writing final video to {output_path}")
-        final_video.write_videofile(
-            output_path,
-            codec="libx264",
-            audio_codec="aac",
-            temp_audiofile=os.path.join(job_dir, "temp_audio.m4a"),
-            remove_temp=True,
-            threads=4
-        )
-        
-        # Close all clips to free resources
-        final_video.close()
-        for clip in video_clips:
-            clip.close()
-        
-        # Clean up temporary files
-        shutil.rmtree(job_dir)
-        
-        return output_filename
-    
-    except Exception as e:
-        logger.error(f"Error processing videos: {str(e)}")
-        # Clean up if possible
-        if 'job_dir' in locals() and os.path.exists(job_dir):
-            shutil.rmtree(job_dir)
-        raise
+                logger.error(f"Error removing {file_path}: {str(e)}")
 
 @app.post("/merge")
-async def merge_videos(request: MergeRequest, background_tasks: BackgroundTasks):
-    try:
-        # Process the videos
-        output_filename = process_videos(request)
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-        
-        # Open the file and return it as a binary response
-        file_like = open(output_path, mode="rb")
-        
-        # Set up background task to clean up the file after sending
-        def cleanup_file():
-            file_like.close()
-            if os.path.exists(output_path):
-                os.remove(output_path)
-                logger.info(f"Cleaned up file: {output_path}")
-        
-        background_tasks.add_task(cleanup_file)
-        
-        # Return the video file as a StreamingResponse
-        return StreamingResponse(
-            content=file_like, 
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename={output_filename}"
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error in merge_videos endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Endpoint to handle binary file upload for narration
-@app.post("/merge-with-file")
-async def merge_videos_with_file(
-    videos: str = Form(...),
-    background_audio: str = Form(...),
-    max_duration: int = Form(600),
-    narration_file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks()
+async def merge_videos(
+    background_tasks: BackgroundTasks,
+    merge_request: str = Form(...),
+    narration_file: UploadFile = File(None)
 ):
+    logger.info("Merge endpoint accessed")
+    # Parse the merge request JSON
+    logger.info(f"Received merge_request: {merge_request}")
+    request_data = json.loads(merge_request)
+    merge_data = MergeRequest(**request_data)
+    logger.info(f"Parsed merge data: {merge_data}")
+    
+    # Create a unique ID for this request
+    request_id = str(uuid.uuid4())
+    logger.info(f"Generated request ID: {request_id}")
+    request_temp_dir = os.path.join(TEMP_DIR, request_id)
+    logger.info(f"Creating temp directory: {request_temp_dir}")
+    os.makedirs(request_temp_dir, exist_ok=True)
+    
+    # List to track files for cleanup - only include temporary directory
+    files_to_cleanup = [request_temp_dir]
+    
     try:
-        # Parse videos list from JSON string
-        import json
-        videos_list = json.loads(videos)
-        
-        # Create a temporary directory for this request
-        job_id = str(uuid.uuid4())
-        job_dir = os.path.join(TEMP_DIR, job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        
-        # Save the uploaded narration file
-        narration_path = os.path.join(job_dir, "narration.mp3")
-        with open(narration_path, "wb") as buffer:
-            shutil.copyfileobj(narration_file.file, buffer)
-        
-        # Create a request object to reuse existing processing logic
-        request = MergeRequest(
-            videos=videos_list,
-            background_audio=background_audio,
-            narration="",  # Not used in this flow
-            max_duration=max_duration
-        )
-        
-        # Process the videos with the local narration file
-        output_filename = process_videos_with_local_narration(request, narration_path)
-        output_path = os.path.join(OUTPUT_DIR, output_filename)
-        
-        # Open the file and return it as a binary response
-        file_like = open(output_path, mode="rb")
-        
-        # Set up background task to clean up the file after sending
-        def cleanup_file():
-            file_like.close()
-            if os.path.exists(output_path):
-                os.remove(output_path)
-                logger.info(f"Cleaned up file: {output_path}")
-            if os.path.exists(job_dir):
-                shutil.rmtree(job_dir)
-        
-        background_tasks.add_task(cleanup_file)
-        
-        # Return the video file as a StreamingResponse
-        return StreamingResponse(
-            content=file_like, 
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f"attachment; filename={output_filename}"
-            }
-        )
-    except Exception as e:
-        logger.error(f"Error in merge_videos_with_file endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Function to process videos with local narration file
-def process_videos_with_local_narration(request: MergeRequest, narration_path: str):
-    """Process the videos and audio files with a local narration file."""
-    try:
-        # Create a unique job ID
-        job_id = str(uuid.uuid4())
-        job_dir = os.path.join(TEMP_DIR, job_id)
-        os.makedirs(job_dir, exist_ok=True)
-        
-        # Download all videos
+        # Download videos
         video_paths = []
-        for i, video_url in enumerate(request.videos):
-            video_path = os.path.join(job_dir, f"video_{i}.mp4")
-            download_file(video_url, video_path)
-            video_paths.append(video_path)
+        for i, video_url in enumerate(merge_data.video_urls):
+            video_path = os.path.join(request_temp_dir, f"video_{i}.mp4")
+            if download_file(video_url, video_path):
+                video_paths.append(video_path)
+            else:
+                return {"error": f"Failed to download video from {video_url}"}
         
-        # Download background audio
-        bg_audio_path = os.path.join(job_dir, "background.mp3")
-        download_file(request.background_audio, bg_audio_path)
-        
-        # Narration file is already local, no need to download
+        if not video_paths:
+            return {"error": "No videos were successfully downloaded"}
         
         # Load video clips
-        video_clips = []
-        for path in video_paths:
-            try:
-                clip = VideoFileClip(path)
-                video_clips.append(clip)
-                logger.info(f"Loaded video clip: {path}, duration: {clip.duration}")
-            except Exception as e:
-                logger.error(f"Error loading video clip {path}: {str(e)}")
-                # Continue with other clips if one fails
+        video_clips = [VideoFileClip(path) for path in video_paths]
         
-        if not video_clips:
-            raise Exception("No valid video clips could be loaded")
+        # Concatenate videos
+        final_clip = concatenate_videoclips(video_clips)
         
-        # Concatenate video clips
-        final_video = concatenate_videoclips(video_clips, method="compose")
+        # Process audio files
+        audio_tracks = []
         
-        # Limit video duration if needed
-        if final_video.duration > request.max_duration:
-            logger.info(f"Trimming video to max duration: {request.max_duration}s")
-            final_video = final_video.subclip(0, request.max_duration)
-        
-        # Load audio clips
-        try:
-            background_audio = AudioFileClip(bg_audio_path)
-            # Loop background audio if it's shorter than the video
-            if background_audio.duration < final_video.duration:
-                background_audio = background_audio.fx(
-                    lambda clip: clip.loop(duration=final_video.duration)
-                )
+        # Background audio
+        if merge_data.background_audio_url:
+            bg_audio_path = os.path.join(request_temp_dir, "background.mp3")
+            if download_file(merge_data.background_audio_url, bg_audio_path):
+                bg_audio = AudioFileClip(bg_audio_path)
+                
+                # Loop background audio if it's shorter than the final video
+                if bg_audio.duration < final_clip.duration:
+                    bg_audio = bg_audio.loop(duration=final_clip.duration)
+                else:
+                    # Trim background audio if it's longer than the final video
+                    bg_audio = bg_audio.subclip(0, final_clip.duration)
+                
+                # Set volume for background audio
+                bg_audio = bg_audio.volumex(merge_data.background_volume)
+                audio_tracks.append(bg_audio)
             else:
-                # Trim background audio if it's longer than the video
-                background_audio = background_audio.subclip(0, final_video.duration)
+                return {"error": "Failed to download background audio"}
+        
+        # Narration audio
+        if narration_file:
+            narration_path = os.path.join(request_temp_dir, "narration.mp3")
+            with open(narration_path, "wb") as buffer:
+                shutil.copyfileobj(narration_file.file, buffer)
             
             narration_audio = AudioFileClip(narration_path)
-            # Trim narration if it's longer than the video
-            if narration_audio.duration > final_video.duration:
-                narration_audio = narration_audio.subclip(0, final_video.duration)
             
-            # Adjust volumes
-            background_audio = background_audio.volumex(0.3)  # Lower background volume
+            # Trim narration if it's longer than the final video
+            if narration_audio.duration > final_clip.duration:
+                narration_audio = narration_audio.subclip(0, final_clip.duration)
             
-            # Combine audio tracks
-            final_audio = CompositeAudioClip([background_audio, narration_audio])
-            
-            # Set the audio of the final video
-            final_video = final_video.set_audio(final_audio)
-            
-        except Exception as e:
-            logger.error(f"Error processing audio: {str(e)}")
-            # Continue with just the video if audio processing fails
+            audio_tracks.append(narration_audio)
         
-        # Save the final video
-        output_filename = f"merged_video_{job_id}.mp4"
+        # Combine audio tracks with video
+        if audio_tracks:
+            final_audio = CompositeAudioClip(audio_tracks)
+            final_clip = final_clip.set_audio(final_audio)
+        
+        # Export the final clip
+        output_filename = f"merged_video_{request_id}.mp4"
         output_path = os.path.join(OUTPUT_DIR, output_filename)
+        logger.info(f"Saving output file to: {output_path}")
         
-        logger.info(f"Writing final video to {output_path}")
-        final_video.write_videofile(
-            output_path,
-            codec="libx264",
-            audio_codec="aac",
-            temp_audiofile=os.path.join(job_dir, "temp_audio.m4a"),
-            remove_temp=True,
-            threads=4
-        )
+        # Ensure output directory exists
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
         
-        # Close all clips to free resources
-        final_video.close()
+        # Check if output directory is writable
+        if not os.access(os.path.dirname(output_path), os.W_OK):
+            logger.error(f"Output directory is not writable: {os.path.dirname(output_path)}")
+            return {"error": "Output directory is not writable"}
+            
+        try:
+            final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+            logger.info(f"Successfully wrote video file to: {output_path}")
+            
+            # Verify file was created
+            if os.path.exists(output_path):
+                logger.info(f"Verified file exists: {output_path}, size: {os.path.getsize(output_path)} bytes")
+                
+                # Create a permanent copy with a fixed name
+                permanent_output_path = os.path.join(OUTPUT_DIR, "final_merged_video.mp4")
+                logger.info(f"Creating permanent copy at: {permanent_output_path}")
+                shutil.copy2(output_path, permanent_output_path)
+                logger.info(f"Permanent copy created successfully")
+            else:
+                logger.error(f"File was not created: {output_path}")
+                return {"error": "Failed to create output file"}
+        except Exception as e:
+            logger.error(f"Error writing video file: {str(e)}")
+            return {"error": f"Error writing video file: {str(e)}"}
+        
+        # Close all clips to release resources
+        final_clip.close()
         for clip in video_clips:
             clip.close()
+        for track in audio_tracks:
+            track.close()
         
-        # Clean up temporary files
-        shutil.rmtree(job_dir)
+        # Return the video as a downloadable file
+        def iterfile():
+            logger.info(f"Streaming file: {output_path}")
+            try:
+                with open(output_path, "rb") as file:
+                    yield from file
+                logger.info(f"Finished streaming file: {output_path}")
+            except Exception as e:
+                logger.error(f"Error streaming file: {str(e)}")
+            
+            # Clean up temporary files and the output file after streaming
+            logger.info(f"Scheduling cleanup of files")
+            background_tasks.add_task(cleanup_files, [request_temp_dir, output_path])
         
-        return output_filename
-    
+        return StreamingResponse(
+            iterfile(),
+            media_type="video/mp4",
+            headers={"Content-Disposition": f"attachment; filename={output_filename}"}
+        )
+        
     except Exception as e:
-        logger.error(f"Error processing videos: {str(e)}")
-        # Clean up if possible
-        if 'job_dir' in locals() and os.path.exists(job_dir):
-            shutil.rmtree(job_dir)
-        raise
+        # Clean up only temporary files in case of error
+        cleanup_files([request_temp_dir])
+        return {"error": str(e)}
 
-# Lifespan events are now handled by the asynccontextmanager above
+@app.get("/")
+async def root():
+    logger.info("Root endpoint accessed")
+    
+    # Check if output directory exists and is writable
+    output_dir_exists = os.path.exists(OUTPUT_DIR)
+    output_dir_writable = os.access(OUTPUT_DIR, os.W_OK) if output_dir_exists else False
+    
+    # Check if temp directory exists and is writable
+    temp_dir_exists = os.path.exists(TEMP_DIR)
+    temp_dir_writable = os.access(TEMP_DIR, os.W_OK) if temp_dir_exists else False
+    
+    return {
+        "message": "Video Merger API is running. Use /merge endpoint to merge videos.",
+        "status": "ok",
+        "directories": {
+            "output_dir": {
+                "path": OUTPUT_DIR,
+                "exists": output_dir_exists,
+                "writable": output_dir_writable
+            },
+            "temp_dir": {
+                "path": TEMP_DIR,
+                "exists": temp_dir_exists,
+                "writable": temp_dir_writable
+            }
+        }
+    }
+
+@app.get("/check-directories")
+async def check_directories():
+    """Check and create output and temp directories"""
+    logger.info("Check directories endpoint accessed")
+    
+    # Ensure directories exist
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Check if directories are writable
+    temp_dir_writable = os.access(TEMP_DIR, os.W_OK)
+    output_dir_writable = os.access(OUTPUT_DIR, os.W_OK)
+    
+    # Create a test file in the output directory to verify write permissions
+    test_file_path = os.path.join(OUTPUT_DIR, "test_write.txt")
+    test_file_success = False
+    try:
+        with open(test_file_path, "w") as f:
+            f.write("Test write access")
+        test_file_success = True
+        # Clean up test file
+        os.remove(test_file_path)
+    except Exception as e:
+        logger.error(f"Failed to write test file: {str(e)}")
+    
+    return {
+        "status": "ok",
+        "directories": {
+            "temp_dir": {
+                "path": TEMP_DIR,
+                "exists": os.path.exists(TEMP_DIR),
+                "writable": temp_dir_writable
+            },
+            "output_dir": {
+                "path": OUTPUT_DIR,
+                "exists": os.path.exists(OUTPUT_DIR),
+                "writable": output_dir_writable,
+                "test_write_success": test_file_success
+            }
+        }
+    }
+
+@app.get("/list-videos")
+async def list_videos():
+    """Information about video streaming"""
+    logger.info("List videos endpoint accessed")
+    
+    return {
+        "message": "Videos are not being saved to the server. They are streamed directly to the client upon creation.",
+        "videos": []
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting server on port 8001")
+    uvicorn.run(app, host="0.0.0.0", port=8001)
