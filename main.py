@@ -1,7 +1,9 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
+from fastapi.responses import StreamingResponse
+import io
 import os
 import tempfile
 import uuid
@@ -183,16 +185,32 @@ def process_videos(request: MergeRequest):
             shutil.rmtree(job_dir)
         raise
 
-@app.post("/merge", response_model=MergeResponse)
+@app.post("/merge")
 async def merge_videos(request: MergeRequest, background_tasks: BackgroundTasks):
     try:
-        # Process the videos in the background
+        # Process the videos
         output_filename = process_videos(request)
+        output_path = os.path.join(OUTPUT_DIR, output_filename)
         
-        # Return the response with the output file path
-        return MergeResponse(
-            output_file=f"/output/{output_filename}",
-            message="Videos and audio merged successfully"
+        # Open the file and return it as a binary response
+        file_like = open(output_path, mode="rb")
+        
+        # Set up background task to clean up the file after sending
+        def cleanup_file():
+            file_like.close()
+            if os.path.exists(output_path):
+                os.remove(output_path)
+                logger.info(f"Cleaned up file: {output_path}")
+        
+        background_tasks.add_task(cleanup_file)
+        
+        # Return the video file as a StreamingResponse
+        return StreamingResponse(
+            content=file_like, 
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f"attachment; filename={output_filename}"
+            }
         )
     except Exception as e:
         logger.error(f"Error in merge_videos endpoint: {str(e)}")
